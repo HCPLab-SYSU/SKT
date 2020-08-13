@@ -9,7 +9,8 @@ import warnings
 from models.model_teacher_vgg import CSRNet as CSRNet_teacher
 from models.model_student_vgg import CSRNet as CSRNet_student
 
-from utils import save_checkpoint, cosine_similarity, scale_process, cal_para, cal_dense_fsp
+from utils import save_checkpoint, cal_para
+from models.distillation import cosine_similarity, scale_process, cal_dense_fsp
 
 import torch
 import torch.nn as nn
@@ -23,11 +24,11 @@ import json
 import dataset
 import time
 
-parser = argparse.ArgumentParser(description='distillation')
+parser = argparse.ArgumentParser(description='CSRNet-SKT distillation')
 parser.add_argument('train_json', metavar='TRAIN',
                     help='path to train json')
 parser.add_argument('val_json', metavar='VAL',
-                    help='path to train json')
+                    help='path to val json')
 parser.add_argument('test_json', metavar='TEST',
                     help='path to test json')
 parser.add_argument('--lr', default=None, type=float,
@@ -41,11 +42,11 @@ parser.add_argument('--teacher_ckpt', '-tc', default=None, type=str,
 parser.add_argument('--student_ckpt', '-sc', default=None, type=str,
                     help='student checkpoint')
 parser.add_argument('--lamb_fsp', '-laf', type=float, default=None,
-                    help='fsp lamda')
+                    help='weight of dense fsp loss')
 parser.add_argument('--lamb_cos', '-lac', type=float, default=None,
-                    help='kl lamda')
+                    help='weight of cos loss')
 parser.add_argument('--gpu', metavar='GPU', type=str, default='0',
-                    help='GPU id to use.')
+                    help='GPU id to use')
 parser.add_argument('--out', metavar='OUTPUT', type=str,
                     help='path to output')
 
@@ -60,15 +61,11 @@ def main():
     mae_best_prec1 = 1e6
     mse_best_prec1 = 1e6
 
-    args.original_lr = args.lr  # 1e-7
-    # args.lr = 1e-7 # 1e-7
     args.batch_size = 1  # args.batch
     args.momentum = 0.95
     args.decay = 5 * 1e-4
     args.start_epoch = 0
-    args.epochs = 3000
-    args.steps = [2000, 2400]
-    args.scales = [0.1, 0.1]
+    args.epochs = 1000
     args.workers = 6
     args.seed = time.time()
     args.print_freq = 400
@@ -126,7 +123,6 @@ def main():
             print("=> no checkpoint found at '{}'".format(args.student_ckpt))
 
     for epoch in range(args.start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
 
         train(train_list, teacher, student, criterion, optimizer, epoch)
         mae_prec1, mse_prec1 = val(val_list, student)
@@ -154,7 +150,7 @@ def train(train_list, teacher, student, criterion, optimizer, epoch):
     losses_h = AverageMeter()
     losses_s = AverageMeter()
     losses_fsp = AverageMeter()
-    losses_kl = AverageMeter()
+    losses_cos = AverageMeter()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     train_loader = torch.utils.data.DataLoader(
@@ -163,7 +159,8 @@ def train(train_list, teacher, student, criterion, optimizer, epoch):
                                 transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                                                             std=[0.229, 0.224, 0.225]),
                             ]),
-                            train=True, seen=student.seen,
+                            train=True,
+                            seen=student.seen,
                             ),
         num_workers=args.workers,
         shuffle=True,
@@ -182,7 +179,7 @@ def train(train_list, teacher, student, criterion, optimizer, epoch):
 
         with torch.no_grad():
             teacher_output = teacher(img)
-            teacher.features.append(teacher_output)  # seven features in total
+            teacher.features.append(teacher_output)
             teacher_fsp_features = [scale_process(teacher.features)]
             teacher_fsp = cal_dense_fsp(teacher_fsp_features)
 
@@ -214,7 +211,7 @@ def train(train_list, teacher, student, criterion, optimizer, epoch):
         losses_h.update(loss_h.item(), img.size(0))
         losses_s.update(loss_s.item(), img.size(0))
         losses_fsp.update(loss_fsp.item(), img.size(0))
-        losses_kl.update(loss_cos.item(), img.size(0))
+        losses_cos.update(loss_cos.item(), img.size(0))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -231,7 +228,7 @@ def train(train_list, teacher, student, criterion, optimizer, epoch):
                 .format(
                 epoch, i, len(train_loader), batch_time=batch_time,
                 data_time=data_time, loss_h=losses_h, loss_s=losses_s,
-                loss_fsp=losses_fsp, loss_kl=losses_kl))
+                loss_fsp=losses_fsp, loss_kl=losses_cos))
 
 
 def val(val_list, model):
@@ -302,22 +299,6 @@ def test(test_list, model):
     mse = torch.sqrt(mse / N)
     print('Test * MAE {mae:.3f} * MSE {mse:.3f} '
           .format(mae=mae, mse=mse))
-
-
-def adjust_learning_rate(optimizer, epoch):
-    # todo: simplify this, just judge the epoch and multiply a scale
-    args.lr = args.original_lr
-
-    for i in range(len(args.steps)):
-        scale = args.scales[i] if i < len(args.scales) else 1
-        if epoch >= args.steps[i]:
-            args.lr = args.lr * scale
-            if epoch == args.steps[i]:
-                break
-        else:
-            break
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = args.lr
 
 
 class AverageMeter(object):
